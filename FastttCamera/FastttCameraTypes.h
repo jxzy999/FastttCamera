@@ -10,7 +10,8 @@
 
 typedef NS_ENUM(NSInteger, FastttCameraDevice) {
     FastttCameraDeviceFront,
-    FastttCameraDeviceRear
+    FastttCameraDeviceRear,
+    FastttCameraDeviceWideAngle
 };
 
 typedef NS_ENUM(NSInteger, FastttCameraFlashMode) {
