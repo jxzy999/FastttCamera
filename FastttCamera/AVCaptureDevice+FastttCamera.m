@@ -50,6 +50,10 @@
 {
     NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
     
+    if (FastttCameraDeviceUltraWide == cameraDevice) {
+        return [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInUltraWideCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+    }
+    
     for (AVCaptureDevice *device in devices) {
         if ([device position] == [self _avPositionForDevice:cameraDevice]) {
             return device;
