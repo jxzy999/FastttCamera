@@ -346,7 +346,9 @@
 - (void)startRunning
 {
     if (![_session isRunning]) {
-        [_session startRunning];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            [self.session startRunning];
+        });
     }
 }
 
