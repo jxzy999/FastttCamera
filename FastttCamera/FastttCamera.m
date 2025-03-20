@@ -26,7 +26,9 @@
 @property (nonatomic, strong) AVCaptureStillImageOutput *stillImageOutput;
 @property (nonatomic, assign) BOOL deviceAuthorized;
 @property (nonatomic, assign) BOOL isCapturingImage;
-
+// 新增线程安全属性
+@property (nonatomic, strong) dispatch_queue_t sessionQueue;
+@property (nonatomic, assign) BOOL isTearingDown;
 @end
 
 @implementation FastttCamera
@@ -53,7 +55,8 @@
 - (instancetype)init
 {
     if ((self = [super init])) {
-        
+        // 关键修改点1：创建专用串行队列
+        _sessionQueue = dispatch_queue_create("com.fastttcamera.session", DISPATCH_QUEUE_SERIAL);
         [self _setupCaptureSession];
         
         _handlesTapFocus = YES;
@@ -101,9 +104,22 @@
     _fastFocus = nil;
     _fastZoom = nil;
     
-    [self _teardownCaptureSession];
-    
+    if (_sessionQueue) {
+            if (dispatch_queue_get_specific(_sessionQueue, "FastttCameraSessionQueue")) {
+                [self _performTeardown];
+            } else {
+                dispatch_sync(_sessionQueue, ^{
+                    [self _performTeardown];
+                });
+            }
+        }
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    if (_previewLayer) {
+            [_previewLayer removeFromSuperlayer];
+            _previewLayer = nil;
+        }
+    
+    
 }
 
 #pragma mark - View Events
@@ -161,7 +177,9 @@
 
 - (void)applicationWillEnterForeground:(NSNotification *)notification
 {
-    [self _setupCaptureSession];
+    if (!self.session) {
+        [self _setupCaptureSession];
+    };
 }
 
 - (void)applicationDidBecomeActive:(NSNotification *)notification
@@ -199,7 +217,9 @@
 
 - (BOOL)isReadyToCapturePhoto
 {
-    return !self.isCapturingImage;
+    @synchronized (self) {
+        return !_isCapturingImage && !_isTearingDown;
+    }
 }
 
 - (void)takePicture
@@ -345,18 +365,35 @@
 
 - (void)startRunning
 {
-    if (![_session isRunning]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-            [self.session startRunning];
+    // 关键修改点2：线程安全启动
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(_sessionQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf.isTearingDown || !strongSelf.session) return;
+            
+            if (![strongSelf.session isRunning]) {
+                [strongSelf.session startRunning];
+                
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([strongSelf.delegate respondsToSelector:@selector(cameraSessionDidStart)]) {
+                        [strongSelf.delegate cameraSessionDidStart];
+                    }
+                });
+            }
         });
-    }
 }
 
 - (void)stopRunning
 {
-    if ([_session isRunning]) {
-        [_session stopRunning];
-    }
+    __weak typeof(self) weakSelf = self;
+        dispatch_async(_sessionQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.session) return;
+            
+            if ([strongSelf.session isRunning]) {
+                [strongSelf.session stopRunning];
+            }
+        });
 }
 
 - (void)_insertPreviewLayer
@@ -391,110 +428,144 @@
 
 - (void)_setupCaptureSession
 {
-    if (_session) {
-        return;
-    }
+    if (_session) return;
     
-#if !TARGET_IPHONE_SIMULATOR
-    [self _checkDeviceAuthorizationWithCompletion:^(BOOL isAuthorized) {
+    // 关键修改点3：授权检查移到队列内
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_sessionQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.isTearingDown) return;
         
-        _deviceAuthorized = isAuthorized;
+#if !TARGET_IPHONE_SIMULATOR
+        [strongSelf _checkDeviceAuthorizationWithCompletion:^(BOOL isAuthorized) {
+            strongSelf.deviceAuthorized = isAuthorized;
 #else
-        _deviceAuthorized = YES;
+            strongSelf.deviceAuthorized = YES;
 #endif
-        if (!_deviceAuthorized && [self.delegate respondsToSelector:@selector(userDeniedCameraPermissionsForCameraController:)]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self.delegate userDeniedCameraPermissionsForCameraController:self];
-            });
-        }
-        
-        if (_deviceAuthorized) {
-            
-            dispatch_async(dispatch_get_main_queue(), ^{
-                
-                _session = [AVCaptureSession new];
-                _session.sessionPreset = AVCaptureSessionPresetPhoto;
-                
-                AVCaptureDevice *device = [AVCaptureDevice cameraDevice:self.cameraDevice];
-                
-                if (!device) {
-                    device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-                }
-                
-                if ([device lockForConfiguration:nil]) {
-                    if([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus]){
-                        device.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+            if (!strongSelf.deviceAuthorized) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([strongSelf.delegate respondsToSelector:@selector(userDeniedCameraPermissionsForCameraController:)]) {
+                        [strongSelf.delegate userDeniedCameraPermissionsForCameraController:strongSelf];
                     }
-                    
-                    device.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
-                    
-                    [device unlockForConfiguration];
+                });
+                return;
+            }
+            
+            dispatch_async(strongSelf.sessionQueue, ^{
+                if (strongSelf.isTearingDown) return;
+                
+                strongSelf.session = [AVCaptureSession new];
+                strongSelf.session.sessionPreset = AVCaptureSessionPresetPhoto;
+                
+                AVCaptureDevice *device = [AVCaptureDevice cameraDevice:strongSelf.cameraDevice];
+                if (!device) device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+                
+                NSError *error = nil;
+                AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+                
+                if (input && [strongSelf.session canAddInput:input]) {
+                    [strongSelf.session addInput:input];
+                } else {
+                    NSLog(@"Error setting up camera input: %@", error.localizedDescription);
+                    return;
                 }
                 
-#if !TARGET_IPHONE_SIMULATOR
-                AVCaptureDeviceInput *deviceInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:nil];
-                [_session addInput:deviceInput];
+                strongSelf.stillImageOutput = [AVCaptureStillImageOutput new];
+                strongSelf.stillImageOutput.outputSettings = @{AVVideoCodecKey: AVVideoCodecJPEG};
                 
-                switch (device.position) {
-                    case AVCaptureDevicePositionBack:
-                        _cameraDevice = FastttCameraDeviceRear;
-                        break;
-                        
-                    case AVCaptureDevicePositionFront:
-                        _cameraDevice = FastttCameraDeviceFront;
-                        break;
-                        
-                    default:
-                        break;
+                if ([strongSelf.session canAddOutput:strongSelf.stillImageOutput]) {
+                    [strongSelf.session addOutput:strongSelf.stillImageOutput];
                 }
                 
-                [self setCameraFlashMode:_cameraFlashMode];
-#endif
+                strongSelf.deviceOrientation = [IFTTTDeviceOrientation new];
                 
-                NSDictionary *outputSettings = @{AVVideoCodecKey:AVVideoCodecJPEG};
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [strongSelf _insertPreviewLayer];
+                    [strongSelf _setPreviewVideoOrientation];
+                });
                 
-                _stillImageOutput = [AVCaptureStillImageOutput new];
-                _stillImageOutput.outputSettings = outputSettings;
-                
-                [_session addOutput:_stillImageOutput];
-                
-                _deviceOrientation = [IFTTTDeviceOrientation new];
-                
-                if (self.isViewLoaded && self.view.window) {
-                    [self startRunning];
-                    [self _insertPreviewLayer];
-                    [self _setPreviewVideoOrientation];
-                    [self _resetZoom];
-                }
+                [strongSelf startRunning];
             });
-        }
 #if !TARGET_IPHONE_SIMULATOR
-    }];
+        }];
 #endif
+    });
 }
 
-- (void)_teardownCaptureSession
-{
+
+//- (void)_teardownCaptureSession
+//{
+//    self.isTearingDown = YES;
+//        __weak typeof(self) weakSelf = self;
+//        dispatch_async(_sessionQueue, ^{
+//            __strong typeof(weakSelf) strongSelf = weakSelf;
+//            if (!strongSelf || !strongSelf.session) {
+//                strongSelf.isTearingDown = NO;
+//                return;
+//            }
+//            
+//            if ([strongSelf.session isRunning]) {
+//                [strongSelf.session stopRunning];
+//            }
+//            
+//            for (AVCaptureInput *input in strongSelf.session.inputs) {
+//                [strongSelf.session removeInput:input];
+//            }
+//            
+//            for (AVCaptureOutput *output in strongSelf.session.outputs) {
+//                [strongSelf.session removeOutput:output];
+//            }
+//            
+//            strongSelf.session = nil;
+//            strongSelf.stillImageOutput = nil;
+//            
+//            dispatch_async(dispatch_get_main_queue(), ^{
+//                [strongSelf _removePreviewLayer];
+//            });
+//            
+//            strongSelf.isTearingDown = NO;
+//        });
+//}
+
+- (void)_teardownCaptureSession {
+    self.isTearingDown = YES;
+    
+    if (dispatch_queue_get_specific(_sessionQueue, "FastttCameraSessionQueue")) {
+        [self _performTeardown];
+    } else {
+        dispatch_sync(_sessionQueue, ^{
+            [self _performTeardown];
+        });
+    }
+}
+
+- (void)_performTeardown {
     if (!_session) {
+        self.isTearingDown = NO;
         return;
     }
-    
-    _deviceOrientation = nil;
     
     if ([_session isRunning]) {
         [_session stopRunning];
     }
     
-    for (AVCaptureDeviceInput *input in [_session inputs]) {
+    // 安全移除输入输出
+    NSArray<AVCaptureInput *> *inputs = [_session.inputs copy];
+    for (AVCaptureInput *input in inputs) {
         [_session removeInput:input];
     }
     
-    [_session removeOutput:_stillImageOutput];
+    NSArray<AVCaptureOutput *> *outputs = [_session.outputs copy];
+    for (AVCaptureOutput *output in outputs) {
+        [_session removeOutput:output];
+    }
+    
+    _session = nil;
     _stillImageOutput = nil;
     
     [self _removePreviewLayer];
     
-    _session = nil;
+    self.isTearingDown = NO;
 }
 
 #pragma mark - Capturing a Photo
