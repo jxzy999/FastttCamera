@@ -301,6 +301,8 @@
 */
 - (void)cameraController:(id<FastttCameraInterface>)cameraController didFinishCapturingImageData:(NSData *)rawJPEGData;
 
+- (void)cameraSessionDidStart;
+
 /**
  *  Called when the camera controller has finished capturing a photo.
  *
